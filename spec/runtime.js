@@ -30,6 +30,23 @@ describe('runtime', function() {
         });
       }, Error, /Template was precompiled with an older version of Handlebars than the current runtime/);
     });
+
+    it('should safely resolve missing partial map entries', function() {
+      equal(Handlebars.VM.resolvePartial(undefined, {}, { name: 'missing' }), undefined);
+    });
+
+    it('should not resolve partials inherited from a polluted prototype', function() {
+      var partials = {};
+      try {
+        // eslint-disable-next-line no-extend-native
+        Object.prototype.widget = '<img src=x onerror="alert(1)">';
+        equal(Handlebars.VM.resolvePartial(partials.widget, {}, { name: 'widget', partials: partials }), undefined);
+        equal(Handlebars.VM.resolvePartial(undefined, {}, { name: 'widget', partials: partials }), undefined);
+        equal(Handlebars.VM.resolvePartial('widget', {}, { partials: partials }), undefined);
+      } finally {
+        delete Object.prototype.widget;
+      }
+    });
   });
 
   describe('#child', function() {

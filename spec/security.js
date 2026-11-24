@@ -132,13 +132,32 @@ describe('security issues', function() {
         expectTemplate('{{__defineGetter__}}').withInput({}).toCompileTo('');
         expectTemplate('{{__defineSetter__}}').withInput({}).toCompileTo('');
         expectTemplate('{{__lookupGetter__}}').withInput({}).toCompileTo('');
+        expectTemplate('{{__lookupSetter__}}').withInput({}).toCompileTo('');
         expectTemplate('{{__proto__}}').withInput({}).toCompileTo('');
 
         expectTemplate('{{lookup "constructor"}}').withInput({}).toCompileTo('');
         expectTemplate('{{lookup "__defineGetter__"}}').withInput({}).toCompileTo('');
         expectTemplate('{{lookup "__defineSetter__"}}').withInput({}).toCompileTo('');
         expectTemplate('{{lookup "__lookupGetter__"}}').withInput({}).toCompileTo('');
+        expectTemplate('{{lookup "__lookupSetter__"}}').withInput({}).toCompileTo('');
         expectTemplate('{{lookup "__proto__"}}').withInput({}).toCompileTo('');
+
+        expectTemplate('{{lookup this "constructor"}}').withInput({}).toCompileTo('');
+        expectTemplate('{{lookup this "__defineGetter__"}}').withInput({}).toCompileTo('');
+        expectTemplate('{{lookup this "__defineSetter__"}}').withInput({}).toCompileTo('');
+        expectTemplate('{{lookup this "__lookupGetter__"}}').withInput({}).toCompileTo('');
+        expectTemplate('{{lookup this "__lookupSetter__"}}').withInput({}).toCompileTo('');
+        expectTemplate('{{lookup this "__proto__"}}').withInput({}).toCompileTo('');
+      });
+
+      it('GHSA-7rx3-28cr-v5wh: should not allow __lookupSetter__ to be called on the context', function() {
+        if (({}).__lookupSetter__ == null) {
+          return this.skip(); // Browser does not support this exploit anyway
+        }
+        expectTemplate('{{__lookupSetter__ "__proto__"}}')
+            .withInput({})
+            .toThrow(/Missing helper: "__lookupSetter__"/);
+        expectTemplate('{{lookup this "__lookupSetter__"}}').withInput({}).toCompileTo('');
       });
     });
 
@@ -154,6 +173,7 @@ describe('security issues', function() {
             expectTemplate('{{__defineGetter__}}').withCompileOptions(compileOptions).withInput({}).toCompileTo('');
             expectTemplate('{{__defineSetter__}}').withCompileOptions(compileOptions).withInput({}).toCompileTo('');
             expectTemplate('{{__lookupGetter__}}').withCompileOptions(compileOptions).withInput({}).toCompileTo('');
+            expectTemplate('{{__lookupSetter__}}').withCompileOptions(compileOptions).withInput({}).toCompileTo('');
             expectTemplate('{{__proto__}}').withCompileOptions(compileOptions).withInput({}).toCompileTo('');
             expectTemplate('{{@root.constructor}}').withCompileOptions(compileOptions).withInput({}).toCompileTo('');
           });
@@ -218,6 +238,520 @@ describe('security issues', function() {
           .withCompileOptions({ compat: true })
           .withInput({})
           .toCompileTo('');
+      });
+    });
+
+    describe('GHSA-2qvq-rjwj-gvw9: partial resolution must not use polluted prototypes', function() {
+      afterEach(function() {
+        delete Object.prototype.widget;
+      });
+
+      it('should not resolve partial names from Object.prototype', function() {
+        // eslint-disable-next-line no-extend-native
+        Object.prototype.widget = '<img src=x onerror="alert(1)">';
+
+        expect(function() {
+          CompilerContext.compileWithPartial('<div>{{> widget}}</div>')({});
+        }).to.throw(/could not be found/);
+      });
+
+      it('should not invoke partial functions inherited from Object.prototype', function() {
+        // eslint-disable-next-line no-extend-native
+        Object.prototype.widget = function() {
+          return '<img src=x onerror="alert(1)">';
+        };
+
+        expect(function() {
+          CompilerContext.compile('<div>{{> widget}}</div>')({});
+        }).to.throw(/could not be found/);
+      });
+
+      it('should still render registered partials', function() {
+        // eslint-disable-next-line no-extend-native
+        Object.prototype.widget = '<img src=x onerror="alert(1)">';
+
+        expectTemplate('<div>{{> widget}}</div>')
+          .withPartial('widget', 'safe')
+          .toCompileTo('<div>safe</div>');
+      });
+    });
+
+    describe('GHSA-2w6w-674q-4c4q, GHSA-xhpv-hc6g-r9c6, GHSA-3mfm-83xf-c92r, GHSA-8r5x-fm3f-whwj: untrusted AST inputs', function() {
+      if (!Handlebars.compile) {
+        return;
+      }
+
+      function createInjectedProgram() {
+        var loc = {
+          source: null,
+          start: { line: 1, column: 0 },
+          end: { line: 1, column: 20 }
+        };
+        return {
+          type: 'Program',
+          body: [
+            {
+              type: 'MustacheStatement',
+              escaped: true,
+              strip: {
+                open: false,
+                close: false
+              },
+              loc: loc,
+              path: {
+                type: 'PathExpression',
+                data: false,
+                depth: 0,
+                parts: ['lookup'],
+                original: 'lookup',
+                loc: loc
+              },
+              params: [
+                {
+                  type: 'PathExpression',
+                  data: false,
+                  depth: 0,
+                  parts: [],
+                  original: 'this',
+                  loc: loc
+                },
+                {
+                  type: 'NumberLiteral',
+                  value: '{},{})) + (Function) + (({}',
+                  original: 1,
+                  loc: loc
+                }
+              ]
+            }
+          ]
+        };
+      }
+
+      it('should reject AST NumberLiteral type confusion in compile()', function() {
+        // NumberLiteral.value is emitted as a raw JavaScript literal, so the
+        // compiler rejects anything that is not a number.
+        expect(function() {
+          var template = Handlebars.compile(createInjectedProgram());
+          template({});
+        }).to.throw(/Invalid AST: NumberLiteral value must be a number/);
+      });
+
+      it('should reject AST NumberLiteral type confusion in precompile()', function() {
+        expect(function() {
+          Handlebars.precompile(createInjectedProgram());
+        }).to.throw(/Invalid AST: NumberLiteral value must be a number/);
+      });
+
+      it('should reject AST objects passed via dynamic partial lookup', function() {
+        expect(function() {
+          var template = Handlebars.compile('{{> (lookup . "payload")}}');
+          template({
+            payload: createInjectedProgram()
+          });
+        }).to.throw(/could not be found/);
+      });
+
+      it('should not compile data objects passed via dynamic partial lookup', function() {
+        // resolvePartial() used to accept any value with a truthy "call"
+        // property as a compiled partial. A JSON object with "call" and
+        // "type": "Program" then reached env.compile() and was rendered as a
+        // template. Such values are now treated as partial names instead.
+        var payload = createInjectedProgram();
+        payload.call = 1;
+        payload.body[0].escaped = false;
+
+        expect(function() {
+          var template = Handlebars.compile('{{> (lookup . "payload")}}');
+          template({ payload: payload });
+        }).to.throw(/could not be found/);
+      });
+
+      it('should not compile AST-shaped objects registered as partials', function() {
+        expect(function() {
+          var template = Handlebars.compile('{{> payload}}');
+          template({}, { partials: { payload: createInjectedProgram() } });
+        }).to.throw(/must be strings or functions/);
+      });
+
+      it('should not compile an AST injected into @partial-block', function() {
+        // A helper that writes arbitrary values into the data frame can
+        // replace @partial-block with a crafted AST. It must never be compiled.
+        var payload = {
+          type: 'Program',
+          body: [
+            {
+              type: 'MustacheStatement',
+              escaped: false,
+              strip: { open: false, close: false },
+              path: {
+                type: 'PathExpression',
+                data: false,
+                depth: 0,
+                parts: ['injected'],
+                original: 'injected'
+              },
+              params: []
+            }
+          ]
+        };
+        var template = Handlebars.compile('{{#> wrapper}}block{{/wrapper}}');
+
+        expect(function() {
+          template({ injected: '<script>alert(1)</script>' }, {
+            helpers: {
+              tamper: function(options) {
+                options.data['partial-block'] = payload;
+              }
+            },
+            partials: {
+              wrapper: '{{tamper}}{{> @partial-block}}'
+            }
+          });
+        }).to.throw(/must be strings or functions/);
+      });
+
+      it('should reject a non-integer param depth in stringParams mode', function() {
+        // pushParam passes val.depth to the getContext opcode. In stringParams
+        // mode, getContext stores the depth in lastContext, which contextName
+        // interpolates into generated code as 'depths[' + depth + ']'. A depth
+        // that is not a non-negative integer is therefore rejected.
+        var loc = {
+          source: null,
+          start: { line: 1, column: 0 },
+          end: { line: 1, column: 20 }
+        };
+        var maliciousAST = {
+          type: 'Program',
+          body: [
+            {
+              type: 'MustacheStatement',
+              escaped: true,
+              strip: { open: false, close: false },
+              loc: loc,
+              path: {
+                type: 'PathExpression',
+                data: false,
+                depth: 0,
+                parts: ['lookup'],
+                original: 'lookup',
+                loc: loc
+              },
+              params: [
+                {
+                  type: 'PathExpression',
+                  data: false,
+                  depth: 'function(){throw new Error("INJECTION")}()',
+                  parts: [],
+                  original: '',
+                  loc: loc
+                }
+              ]
+            }
+          ]
+        };
+
+        expect(function() {
+          var template = Handlebars.compile(maliciousAST, {
+            stringParams: true
+          });
+          template({});
+        }).to.throw(
+          /Invalid AST: PathExpression depth must be a non-negative integer/
+        );
+      });
+
+      it('should reject a non-integer data path depth', function() {
+        // lookupData interpolates the depth into generated code as
+        // 'container.data(data, ' + depth + ')'.
+        var maliciousAST = {
+          type: 'Program',
+          body: [
+            {
+              type: 'MustacheStatement',
+              escaped: true,
+              strip: { open: false, close: false },
+              path: {
+                type: 'PathExpression',
+                data: true,
+                depth: '1) + (function(){throw new Error("INJECTION")})() + (1',
+                parts: ['root'],
+                original: '@root'
+              },
+              params: []
+            }
+          ]
+        };
+
+        expect(function() {
+          Handlebars.compile(maliciousAST)({});
+        }).to.throw(
+          /Invalid AST: PathExpression depth must be a non-negative integer/
+        );
+      });
+
+      it('should reject non-array blockParams', function() {
+        // The compiler reads program.blockParams.length from the AST and
+        // javascript-compiler.js interpolates that value verbatim into a
+        // container.program(...) call. blockParams must therefore be an array
+        // of strings, so that the length is always a safe integer.
+        var maliciousAST = {
+          type: 'Program',
+          loc: { start: { line: 1, column: 0 } },
+          body: [
+            {
+              type: 'BlockStatement',
+              path: {
+                type: 'PathExpression',
+                data: false,
+                depth: 0,
+                parts: ['rce'],
+                original: 'rce',
+                loc: { start: { line: 1, column: 0 } }
+              },
+              params: [],
+              program: {
+                type: 'Program',
+                blockParams: {
+                  length: "(()=>{throw new Error('INJECTION')})()"
+                },
+                body: [],
+                loc: { start: { line: 1, column: 0 } }
+              },
+              openStrip: { open: false, close: false },
+              inverseStrip: { open: false, close: false },
+              closeStrip: { open: false, close: false },
+              loc: { start: { line: 1, column: 0 } }
+            }
+          ]
+        };
+
+        expect(function() {
+          var template = Handlebars.compile(maliciousAST, {
+            stringParams: true
+          });
+          template({});
+        }).to.throw(/Invalid AST: Program blockParams must be an array/);
+      });
+
+      it('should reject non-number NumberLiteral values in stringParams mode', function() {
+        // In stringParams mode, pushStringParam emits any non-string param
+        // value as a raw literal, and the code generator concatenates array
+        // chunks verbatim. The NumberLiteral handler therefore rejects any
+        // value that is not a number.
+        var loc = {
+          source: null,
+          start: { line: 1, column: 0 },
+          end: { line: 1, column: 20 }
+        };
+        var maliciousAST = {
+          type: 'Program',
+          body: [
+            {
+              type: 'MustacheStatement',
+              escaped: true,
+              strip: { open: false, close: false },
+              loc: loc,
+              path: {
+                type: 'PathExpression',
+                data: false,
+                depth: 0,
+                parts: ['helper'],
+                original: 'helper',
+                loc: loc
+              },
+              params: [
+                {
+                  type: 'NumberLiteral',
+                  value: ['(function(){throw new Error("INJECTION")})()'],
+                  original: 1,
+                  loc: loc
+                }
+              ]
+            }
+          ]
+        };
+
+        expect(function() {
+          var template = Handlebars.compile(maliciousAST, {
+            stringParams: true
+          });
+          template({});
+        }).to.throw(/Invalid AST: NumberLiteral value must be a number/);
+      });
+
+      it('should stringify non-string PathExpression originals in stringParams mode', function() {
+        // pushStringParam emits non-string values as raw literals, so the
+        // `original` of a path param must never reach it as anything else.
+        var maliciousAST = {
+          type: 'Program',
+          body: [
+            {
+              type: 'MustacheStatement',
+              escaped: true,
+              strip: { open: false, close: false },
+              path: {
+                type: 'PathExpression',
+                data: false,
+                depth: 0,
+                parts: ['helper'],
+                original: 'helper'
+              },
+              params: [
+                {
+                  type: 'PathExpression',
+                  data: false,
+                  depth: 0,
+                  parts: ['foo'],
+                  original: ['(function(){throw new Error("INJECTION")})()']
+                }
+              ]
+            }
+          ]
+        };
+
+        var template = Handlebars.compile(maliciousAST, { stringParams: true });
+        expect(template({}, {
+          helpers: {
+            helper: function(value) {
+              return typeof value;
+            }
+          }
+        })).to.equal('string');
+      });
+
+      it('should only dispatch known AST node types', function() {
+        // Compiler#accept() dispatches on node.type. Without an allowlist, a
+        // crafted type would call an arbitrary Compiler method with the node as
+        // its argument. Params are used because WhitespaceControl does not
+        // visit them, so they reach the compiler unchecked.
+        var loc = {
+          source: null,
+          start: { line: 1, column: 0 },
+          end: { line: 1, column: 20 }
+        };
+        [
+          'compile',
+          'opcode',
+          'pushParam',
+          'constructor',
+          'hasOwnProperty',
+          '__proto__'
+        ].forEach(function(type) {
+          var template = Handlebars.compile({
+            type: 'Program',
+            body: [
+              {
+                type: 'MustacheStatement',
+                escaped: true,
+                strip: { open: false, close: false },
+                loc: loc,
+                path: {
+                  type: 'PathExpression',
+                  data: false,
+                  depth: 0,
+                  parts: ['helper'],
+                  original: 'helper',
+                  loc: loc
+                },
+                params: [{ type: type, loc: loc }]
+              }
+            ]
+          });
+          expect(function() {
+            template({});
+          }).to.throw(/Unknown type: /);
+        });
+      });
+    });
+
+    describe('GHSA-442j-39wm-28r2: lookup must return checked value', function() {
+      it('should use the validated value from lookupProperty() in compat mode', function() {
+        var input = { child: {} };
+        var readCount = 0;
+        Object.defineProperty(input, 'unstable', {
+          enumerable: true,
+          get: function() {
+            readCount++;
+            return readCount === 1 ? 'first-read' : 'second-read';
+          }
+        });
+
+        expectTemplate('{{#with child}}{{unstable}}{{/with}}')
+          .withInput(input)
+          .withCompileOptions({ compat: true })
+          .toCompileTo('first-read');
+      });
+    });
+
+    describe('GHSA-9cx6-37pm-9jff: malformed decorators should fail safely', function() {
+      it('should throw a controlled error for unknown decorators', function() {
+        expect(function() {
+          CompilerContext.compile('{{*notRegistered}}')({});
+        }).to.throw(/Missing decorator: "notRegistered"/);
+      });
+
+      it('should throw a controlled error for unknown block decorators', function() {
+        expect(function() {
+          CompilerContext.compile('{{#*notRegistered}}content{{/notRegistered}}')({});
+        }).to.throw(/Missing decorator: "notRegistered"/);
+      });
+
+      it('should still run registered decorators', function() {
+        expectTemplate('{{#*inline "myPartial"}}success{{/inline}}{{> myPartial}}')
+          .toCompileTo('success');
+      });
+    });
+
+    describe('GHSA-3mfm-83xf-c92r: @partial-block must not resolve from polluted prototype', function() {
+      if (!Handlebars.compile) {
+        return;
+      }
+
+      afterEach(function() {
+        delete Object.prototype['partial-block'];
+        delete Object.prototype['@partial-block'];
+      });
+
+      it('should not resolve @partial-block from Object.prototype', function() {
+        // eslint-disable-next-line no-extend-native
+        Object.prototype['partial-block'] = '<img src=x onerror="alert(1)">';
+
+        expect(function() {
+          Handlebars.compile('{{> @partial-block}}')({});
+        }).to.throw(/could not be found/);
+      });
+
+      it('should not resolve @partial-block from Object.prototype inside a partial', function() {
+        // eslint-disable-next-line no-extend-native
+        Object.prototype['partial-block'] = '<img src=x onerror="alert(1)">';
+
+        Handlebars.registerPartial('testPartial', '{{> @partial-block}}');
+        try {
+          expect(function() {
+            Handlebars.compile('{{> testPartial}}')({});
+          }).to.throw(/could not be found/);
+        } finally {
+          Handlebars.unregisterPartial('testPartial');
+        }
+      });
+
+      it('should not resolve an inherited "@partial-block" partial', function() {
+        // eslint-disable-next-line no-extend-native
+        Object.prototype['@partial-block'] = '<img src=x onerror="alert(1)">';
+
+        expect(function() {
+          Handlebars.compile('{{> @partial-block}}')({});
+        }).to.throw(/could not be found/);
+      });
+
+      it('should still render legitimate @partial-block content', function() {
+        Handlebars.registerPartial('wrapper', '<div>{{> @partial-block}}</div>');
+        try {
+          var result = Handlebars.compile('{{#> wrapper}}hello{{/wrapper}}')({});
+          expect(result).to.equal('<div>hello</div>');
+        } finally {
+          Handlebars.unregisterPartial('wrapper');
+        }
       });
     });
 });

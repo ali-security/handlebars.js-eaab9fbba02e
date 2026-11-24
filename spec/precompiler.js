@@ -145,7 +145,7 @@ describe('precompiler', function() {
   it('should output amd partials', function() {
     Handlebars.precompile = function() { return 'amd'; };
     Precompiler.cli({templates: [emptyTemplate], amd: true, partial: true});
-    equal(/return Handlebars\.partials\['empty'\]/.test(log), true);
+    equal(/return Handlebars\.partials\["empty"\]/.test(log), true);
     equal(/template\(amd\)/.test(log), true);
   });
   it('should output multiple amd partials', function() {
@@ -308,6 +308,112 @@ describe('precompiler', function() {
       Precompiler.loadTemplates({}, function(err, opts) {
         equal(opts.templates.length, 0);
         done(err);
+      });
+    });
+  });
+
+  describe('GHSA-xjpj-3mr7-gcpf: precompiler output escaping', function() {
+    function runCliAndCaptureOutput(options) {
+      log = '';
+      Precompiler.cli(options);
+      return log;
+    }
+
+    it('should not inject raw template names into generated code', function() {
+      var output = runCliAndCaptureOutput({
+        templates: [
+          {
+            name: "evil'];global.__xjpjName=1;//",
+            source: ''
+          }
+        ],
+        amd: true
+      });
+
+      expect(output).to.not.match(/\['evil'\];global\.__xjpjName=1/);
+      expect(output).to.contain('templates["evil\'];global.__xjpjName=1;//"] = template(');
+    });
+
+    it('should not inject raw commonjs option values into generated code', function() {
+      var output = runCliAndCaptureOutput({
+        templates: [{ name: 'safe', source: '' }],
+        commonjs: 'handlebars");global.__xjpjCommon=1;//'
+      });
+
+      expect(output).to.not.match(
+        /require\("handlebars"\);global\.__xjpjCommon=1/
+      );
+      expect(output).to.contain('require("handlebars\\");global.__xjpjCommon=1;//");');
+    });
+
+    it('should not inject raw handlebarPath option values into generated code', function() {
+      var output = runCliAndCaptureOutput({
+        templates: [{ name: 'safe', source: '' }],
+        amd: true,
+        handlebarPath: "'], function() {}); global.__xjpjAmd=1; //"
+      });
+
+      expect(output).to.not.match(/define\(\[''\], function\(\) \{\}\); global\.__xjpjAmd=1/);
+      expect(output).to.contain('define(["\'], function() {}); global.__xjpjAmd=1; //handlebars.runtime"], function(Handlebars) {');
+    });
+
+    it('should reject invalid namespace expressions', function() {
+      expect(function() {
+        runCliAndCaptureOutput({
+          templates: [{ name: 'safe', source: '' }],
+          namespace: 'App.ns;global.__xjpjNamespace=1;//'
+        });
+      }).to.throw(/Invalid namespace/);
+    });
+
+    it('should accept dotted namespace identifiers', function() {
+      var output = runCliAndCaptureOutput({
+        templates: [{ name: 'safe', source: '' }],
+        namespace: 'App.templates'
+      });
+
+      expect(output).to.contain('templates = App.templates = App.templates || {};');
+    });
+
+    it('should sanitize sourceMappingURL comment values', function() {
+      var output = runCliAndCaptureOutput({
+        templates: [{ name: 'safe', path: 'safe.handlebars', source: 'x' }],
+        map: 'good.js.map\n;global.__xjpjMap=1;//'
+      });
+
+      expect(output).to.contain('sourceMappingURL=good.js.map;global.__xjpjMap=1;//');
+      expect(output).to.not.match(
+        /sourceMappingURL=[^\n]*\n;global\.__xjpjMap=1/
+      );
+    });
+
+    it('should sanitize sourceMappingURL comment values when minifying', function() {
+      var output = runCliAndCaptureOutput({
+        templates: [{ name: 'safe', path: 'safe.handlebars', source: 'x' }],
+        min: true,
+        map: 'good.js.map\n;global.__xjpjMinMap=1;//'
+      });
+
+      expect(output).to.contain(
+        'sourceMappingURL=good.js.map;global.__xjpjMinMap=1;//'
+      );
+      expect(output).to.not.match(
+        /sourceMappingURL=[^\n]*\n;global\.__xjpjMinMap=1/
+      );
+    });
+
+    it('should percent-encode "<" in sourceMappingURL comment values', function() {
+      [false, true].forEach(function(min) {
+        var output = runCliAndCaptureOutput({
+          templates: [{ name: 'safe', path: 'safe.handlebars', source: 'x' }],
+          min: min,
+          map: '</script><!--<script>.map'
+        });
+
+        expect(output).to.contain(
+          'sourceMappingURL=%3C/script>%3C!--%3Cscript>.map'
+        );
+        expect(output).to.not.match(/<(!--|\/?script)/i);
       });
     });
   });
